@@ -21,6 +21,47 @@ from simple_knn._C import distCUDA2
 from utils.graphics_utils import BasicPointCloud
 from utils.general_utils import strip_symmetric, build_scaling_rotation
 
+
+
+# class GaussianAttention(torch.nn.Module):
+#     def __init__(self, input_dim, attention_dim):
+#         super(GaussianAttention, self).__init__()
+#         self.fc1 = torch.nn.Linear(input_dim, attention_dim)
+#         self.relu = torch.nn.ReLU()
+#         self.fc2 = torch.nn.Linear(attention_dim, 1)
+#         self.sigmoid = torch.nn.Sigmoid()
+
+#     def forward(self, x):
+#         x = self.fc1(x)
+#         x = self.relu(x)
+#         x = self.fc2(x)
+#         attention_weight = self.sigmoid(x)
+#         return attention_weight
+
+class GaussianAttention(torch.nn.Module):
+    def __init__(self, input_dim, attention_dim):
+        super(GaussianAttention, self).__init__()
+        self.layer1 = torch.nn.Linear(input_dim, attention_dim)
+        self.relu1 = torch.nn.ReLU()
+        self.batchnorm1 = torch.nn.BatchNorm1d(attention_dim)
+        self.layer2 = torch.nn.Linear(attention_dim, attention_dim // 2)
+        self.relu2 = torch.nn.ReLU()
+        self.dropout = torch.nn.Dropout(p=0.5)  # Assuming you want to include dropout
+        self.layer3 = torch.nn.Linear(attention_dim // 2, 1)
+        self.sigmoid = torch.nn.Sigmoid()
+
+    def forward(self, x):
+        x = self.layer1(x)
+        x = self.batchnorm1(x)
+        x = self.relu1(x)
+        x = self.layer2(x)
+        x = self.relu2(x)
+        x = self.dropout(x)  # Apply dropout after activation
+        x = self.layer3(x)
+        attention_weight = self.sigmoid(x)
+        return attention_weight
+
+
 class GaussianModel:
 
     def setup_functions(self):
@@ -57,6 +98,9 @@ class GaussianModel:
         self.percent_dense = 0
         self.spatial_lr_scale = 0
         self.setup_functions()
+
+        self.attention_module = GaussianAttention(input_dim = 11, attention_dim=64).cuda()
+
 
     def capture(self):
         return (
@@ -405,3 +449,30 @@ class GaussianModel:
     def add_densification_stats(self, viewspace_point_tensor, update_filter):
         self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter,:2], dim=-1, keepdim=True)
         self.denom[update_filter] += 1
+
+
+    def prepare_attention_input(self):
+        input_features = torch.cat([self.get_xyz, self.get_scaling, self.get_rotation, self.get_opacity], dim=1)
+        return input_features
+    
+    def compute_attention_weights(self):
+        with torch.no_grad():
+            input_features = self.prepare_attention_input()
+            attention_weights = self.attention_module(input_features)
+            return attention_weights
+
+    def apply_attention_to_gradients(self):
+        attention_weights = self.compute_attention_weights()
+        target_params = ['_xyz', '_scaling']
+        
+        for param_name in target_params:
+            param = getattr(self, param_name)
+            if param.grad is not None:
+                #print(param.grad)
+                reshaped_weights = attention_weights.view(-1, *[1 for _ in range(len(param.grad.shape)-1)])
+                # Apply the attention weights to the gradients
+                param.grad *= reshaped_weights
+            else: print("Grad params are not available")
+
+        del attention_weights
+        torch.cuda.empty_cache() 
